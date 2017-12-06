@@ -7,9 +7,7 @@ from ethereum.config import default_config
 from pyethapp.config import update_config_with_defaults, get_default_config
 from ethereum.pow.ethpow import mine
 from ethereum.slogging import get_logger, configure_logging
-from ethereum.hybrid_casper import chain as hybrid_casper_chain
 from ethereum.tools import tester
-from ethereum.tests.hybrid_casper.testing_lang import TestLangHybrid
 from ethereum.utils import encode_hex
 from pyethapp.app import EthApp
 from pyethapp.db_service import DBService
@@ -19,7 +17,8 @@ from pyethapp.validator_service import ValidatorService
 from pyethapp.pow_service import PoWService
 
 log = get_logger('tests.validator_service')
-configure_logging('validator:debug,eth.chainservice:debug')
+# configure_logging('tests.validator_service:debug,validator:debug,eth.chainservice:debug,eth.pb.tx:debug')
+configure_logging('tests.validator_service:debug,validator:debug,eth.chainservice:debug')
 
 class PeerManagerMock(BaseService):
     name = 'peermanager'
@@ -111,17 +110,35 @@ def test_app(request, tmpdir):
     return app
 
 def test_generate_valcode(test_app):
+    v = test_app.services.validator
     epoch_length = test_app.config['eth']['block']['EPOCH_LENGTH']
 
-    # This block should cause the validator to send the valcode tx
-    # This block should cause the validator to send the deposit tx
-    # In this block the validator should be active woop woop
+    assert v.valcode_tx is None
+    assert v.deposit_tx is None
+
+    # Mining these first three blocks does the following:
+    # 1. validator sends the valcode tx
+    test_app.mine_blocks(1)
+    assert v.valcode_tx is not None
+    assert v.deposit_tx is None
+    assert not v.chain.state.get_code(self.valcode_addr)
+
+    # 2. validator sends the deposit tx
+    test_app.mine_blocks(1)
+    assert v.valcode_tx is not None
+    assert v.deposit_tx is not None
+    assert v.chain.state.get_code(self.valcode_addr)
+
+    # 3. validator becomes active
     test_app.mine_blocks(3)
 
-    # Move to the next epoch
+    # Two more epochs and the validator should begin voting
     test_app.mine_epoch()
     test_app.mine_epoch()
+
+    # Two more epochs and the vote_frac has a value (since it requires there
+    # to be at least one vote for both the current and the prev epoch)
     test_app.mine_epoch()
-    # test_app.mine_blocks(1)
+    test_app.mine_epoch()
 
     assert True
