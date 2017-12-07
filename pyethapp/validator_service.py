@@ -155,10 +155,8 @@ class ValidatorService(BaseService):
             log.info('[hybrid_casper] Current epoch: {} - Current dynasty: {} - Start dynasty: {} - End dynasty: {}'.format(
                 casper.get_current_epoch(),
                 casper.get_dynasty(),
-                "?",
-                "?",
-                # validator_info.start_dynasty,
-                # validator_info.end_dynasty,
+                casper.get_validators__start_dynasty(validator_index),
+                casper.get_validators__end_dynasty(validator_index),
             ))
             is_justified = casper.get_votes__is_justified(casper.get_current_epoch())
             is_finalized = casper.get_votes__is_finalized(casper.get_current_epoch()-1)
@@ -179,6 +177,7 @@ class ValidatorService(BaseService):
             log.info('[hybrid_casper] Not voting this round')
 
     def is_logged_in(self, casper, target_epoch, validator_index):
+        log.debug('[hybrid_casper] checking is_logged_in for target {} and vidx {}'.format(target_epoch, validator_index))
         start_dynasty = casper.get_validators__start_dynasty(validator_index)
         end_dynasty = casper.get_validators__end_dynasty(validator_index)
         current_dynasty = casper.get_dynasty_in_epoch(target_epoch)
@@ -249,9 +248,14 @@ class ValidatorService(BaseService):
         if self.valcode_addr is None:
             raise Exception('Valcode address not set')
         try:
-            return casper.get_validator_indexes(self.coinbase.address)
+            vidx = casper.get_validator_indexes(self.coinbase.address)
         except tester.TransactionFailed:
             return None
+
+        # Zero represents failure
+        if vidx == 0:
+            return None
+        return vidx
 
     def mk_transaction(self, to=b'\x00' * 20, value=0, data=b'',
                        gasprice=tester.GASPRICE, startgas=tester.STARTGAS, nonce=None):

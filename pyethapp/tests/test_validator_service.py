@@ -1,24 +1,45 @@
 from itertools import count
+import os
 import pytest
+import rlp
 import shutil
 import tempfile
 from devp2p.service import BaseService
 from ethereum.config import default_config
 from pyethapp.config import update_config_with_defaults, get_default_config
+from ethereum.hybrid_casper import casper_utils
 from ethereum.pow.ethpow import mine
 from ethereum.slogging import get_logger, configure_logging
 from ethereum.tools import tester
-from ethereum.utils import encode_hex
+from ethereum.utils import encode_hex, decode_int
 from pyethapp.app import EthApp
 from pyethapp.db_service import DBService
 from pyethapp.eth_service import ChainService
-from pyethapp.accounts import Account, AccountsService
 from pyethapp.validator_service import ValidatorService
 from pyethapp.pow_service import PoWService
 
 log = get_logger('tests.validator_service')
-# configure_logging('tests.validator_service:debug,validator:debug,eth.chainservice:debug,eth.pb.tx:debug')
 configure_logging('tests.validator_service:debug,validator:debug,eth.chainservice:debug')
+
+class MockAddress(object):
+    def __init__(self):
+        self.address = tester.accounts[0]
+        self.privkey = tester.keys[0]
+    def sign_tx(self, tx):
+        return tx.sign(self.privkey)
+mock_address = MockAddress()
+
+class AccountsServiceMock(BaseService):
+    name = 'accounts'
+
+    def __init__(self, app):
+        super(AccountsServiceMock, self).__init__(app)
+        self.coinbase = mock_address
+
+    def find(self, address):
+
+        assert address == encode_hex(tester.accounts[0])
+        return mock_address
 
 class PeerManagerMock(BaseService):
     name = 'peermanager'
@@ -33,9 +54,11 @@ def test_app(request, tmpdir):
             for i in range(0, n):
                 self.mine_one_block()
 
-        def mine_epoch(self):
+        def mine_to_next_epoch(self, number_of_epochs=1):
             epoch_length = self.config['eth']['block']['EPOCH_LENGTH']
-            return self.mine_blocks(epoch_length)
+            distance_to_next_epoch = (epoch_length - self.services.chain.chain.state.block_number) % epoch_length
+            number_of_blocks = distance_to_next_epoch + epoch_length*(number_of_epochs-1) + 2
+            return self.mine_blocks(number_of_blocks)
 
         def mine_one_block(self):
             """Mine until a valid nonce is found.
@@ -69,7 +92,6 @@ def test_app(request, tmpdir):
             return chain.head
 
     config = {
-        'data_dir': str(tmpdir),
         'db': {'implementation': 'EphemDB'},
         'eth': {
             'block': {  # reduced difficulty, increased gas limit, allocations to test accounts
@@ -90,6 +112,7 @@ def test_app(request, tmpdir):
     }
 
     services = [
+        AccountsServiceMock,
         DBService,
         ChainService,
         PoWService,
@@ -100,45 +123,119 @@ def test_app(request, tmpdir):
     update_config_with_defaults(config, {'eth': {'block': default_config}})
     app = TestApp(config)
 
-    # Add AccountsService first and initialize with coinbase account
-    AccountsService.register_with_app(app)
-    app.services.accounts.add_account(Account.new('', tester.keys[0]), store=False)
-
     for service in services:
         service.register_with_app(app)
 
     return app
 
-def test_generate_valcode(test_app):
+def test_login_sequence(test_app):
     v = test_app.services.validator
-    epoch_length = test_app.config['eth']['block']['EPOCH_LENGTH']
 
     assert v.valcode_tx is None
     assert v.deposit_tx is None
+
+    t = tester.State(v.chain.state.ephemeral_clone())
+    c = tester.ABIContract(t, casper_utils.casper_abi, v.chain.casper_address)
+    assert c.get_current_epoch() == 0
 
     # Mining these first three blocks does the following:
     # 1. validator sends the valcode tx
     test_app.mine_blocks(1)
     assert v.valcode_tx is not None
+    assert v.valcode_addr is not None
     assert v.deposit_tx is None
-    assert not v.chain.state.get_code(self.valcode_addr)
+    assert not v.chain.state.get_code(v.valcode_addr)
 
     # 2. validator sends the deposit tx
     test_app.mine_blocks(1)
     assert v.valcode_tx is not None
     assert v.deposit_tx is not None
-    assert v.chain.state.get_code(self.valcode_addr)
+    assert v.chain.state.get_code(v.valcode_addr)
+
+    # This should still fail
+    validator_index = v.get_validator_index(v.chain.state)
+    assert validator_index is None
 
     # 3. validator becomes active
     test_app.mine_blocks(3)
 
-    # Two more epochs and the validator should begin voting
-    test_app.mine_epoch()
-    test_app.mine_epoch()
+    # Check validator index
+    validator_index = v.get_validator_index(v.chain.state)
+    assert validator_index == 1
 
-    # Two more epochs and the vote_frac has a value (since it requires there
+    # Go from epoch 0 -> epoch 1
+    test_app.mine_to_next_epoch()
+    # Check that epoch 0 was finalized (no validators logged in)
+    t = tester.State(v.chain.state.ephemeral_clone())
+    c = tester.ABIContract(t, casper_utils.casper_abi, v.chain.casper_address)
+    assert c.get_current_epoch() == 1
+    assert c.get_votes__is_finalized(0)
+
+    # Go from epoch 1 -> epoch 2
+    test_app.mine_to_next_epoch()
+    # Check that epoch 1 was finalized (no validators logged in)
+    t = tester.State(v.chain.state.ephemeral_clone())
+    c = tester.ABIContract(t, casper_utils.casper_abi, v.chain.casper_address)
+    assert c.get_current_epoch() == 2
+    assert c.get_votes__is_finalized(1)
+
+    # Make sure we're not logged in yet
+    target_epoch = v.chain.state.block_number // v.epoch_length
+    t = tester.State(v.chain.state.ephemeral_clone())
+    c = tester.ABIContract(t, casper_utils.casper_abi, v.chain.casper_address)
+    assert not v.is_logged_in(c, target_epoch, validator_index)
+
+    # Mine one more epoch and we should be logged in
+    test_app.mine_to_next_epoch()
+    t = tester.State(v.chain.state.ephemeral_clone())
+    c = tester.ABIContract(t, casper_utils.casper_abi, v.chain.casper_address)
+    assert c.get_current_epoch() == 3
+    target_epoch = v.chain.state.block_number // v.epoch_length
+    source_epoch = c.get_recommended_source_epoch()
+    assert v.is_logged_in(c, target_epoch, validator_index)
+
+    # Make sure the vote transaction was generated
+    vote = v.votes[target_epoch]
+    assert vote is not None
+    vote_decoded = rlp.decode(vote)
+    # validator index
+    assert decode_int(vote_decoded[0]) == validator_index
+    # target
+    assert decode_int(vote_decoded[2]) == target_epoch
+    # source
+    assert decode_int(vote_decoded[3]) == source_epoch
+
+    # Check deposit level
+    # TODO: do not hardcode; pass into validator service on create
+    assert c.get_total_curdyn_deposits() == 5000 * 10**18
+
+    # This should still fail
+    with pytest.raises(tester.TransactionFailed):
+        c.get_main_hash_voted_frac()
+
+    # One more epoch and the vote_frac has a value (since it requires there
     # to be at least one vote for both the current and the prev epoch)
-    test_app.mine_epoch()
-    test_app.mine_epoch()
+    test_app.mine_to_next_epoch()
+    assert c.get_current_epoch() == 4
 
-    assert True
+    # One more block to mine the vote
+    test_app.mine_blocks(1)
+
+    # Check deposit level (gone up) and vote_frac
+    t = tester.State(v.chain.state.ephemeral_clone())
+    c = tester.ABIContract(t, casper_utils.casper_abi, v.chain.casper_address)
+    voted_frac = c.get_main_hash_voted_frac()
+    assert c.get_total_curdyn_deposits() > 5000 * 10**18
+    assert voted_frac > 0.99
+
+def test_logout_and_withdraw(test_app):
+    pass
+
+def test_double_login(test_app):
+    pass
+
+def test_login_logout_login(test_app):
+    pass
+
+def catch_violation(test_app):
+    pass
