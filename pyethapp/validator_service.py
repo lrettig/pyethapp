@@ -25,7 +25,7 @@ class ValidatorService(BaseService):
 
         self.chainservice = app.services.chain
         self.chain = self.chainservice.chain
-        self.deposit_size = 5000 * 10**18
+        self.deposit_size = self.config['eth']['block']['DEPOSIT_SIZE']
         self.valcode_addr = None
         self.did_broadcast_valcode = False
         self.did_broadcast_deposit = False
@@ -70,6 +70,22 @@ class ValidatorService(BaseService):
         # Generate transactions
         logout_tx = self.mk_logout_tx(logout_msg)
         self.broadcast_tx(logout_tx)
+
+    def broadcast_withdraw(self):
+        casper = tester.ABIContract(tester.State(self.chain.state.ephemeral_clone()), casper_utils.casper_abi,
+                                    self.chain.casper_address)
+        validator_index = self.get_validator_index(self.chain.state)
+        withdrawal_delay = casper.get_withdrawal_delay()
+        end_dynasty = casper.get_validators__end_dynasty(validator_index)
+        end_epoch = casper.get_dynasty_start_epoch(end_dynasty + 1)
+        current_dynasty = casper.get_dynasty()
+        current_epoch = casper.get_current_epoch()
+        log.info(('[hybrid_casper] Attempting withdraw at dynasty {} - end dynasty {} - ' +
+            'current_epoch {} - end_epoch {} - withdrawal_delay {} - validator idx {}').format(
+                current_dynasty, end_dynasty, current_epoch, end_epoch, withdrawal_delay, validator_index))
+
+        withdraw_tx = self.mk_withdraw_tx(validator_index)
+        self.broadcast_tx(withdraw_tx)
 
     def update(self):
         log.info('[hybrid_casper] validator {} updating'.format(self))
