@@ -170,9 +170,7 @@ class ChainService(WiredService):
 
         genesis_data = sce.get('genesis_data', {})
         if not genesis_data:
-            # genesis_data = casper_utils.make_casper_genesis(ALLOC, 10, 100, 0.02, 0.002)
             genesis_data = casper_utils.make_casper_genesis(env)
-        #     genesis_data = mk_genesis_data(env)
         self.chain = Chain(
             genesis=genesis_data,
             reset_genesis=True,
