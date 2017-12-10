@@ -25,10 +25,9 @@ class ValidatorService(BaseService):
 
         self.chainservice = app.services.chain
         self.chain = self.chainservice.chain
-        self.valcode_tx = None
-        self.deposit_tx = None
         self.deposit_size = 5000 * 10**18
         self.valcode_addr = None
+        self.did_broadcast_valcode = False
         self.did_broadcast_deposit = False
         self.votes = dict()
         self.latest_target_epoch = -1
@@ -52,50 +51,25 @@ class ValidatorService(BaseService):
             return
         self.update()
 
-    def generate_valcode_tx(self):
-        nonce = self.chain.state.get_nonce(self.coinbase.address)
-        # Generate transaction
-        valcode_tx = self.mk_validation_code_tx(nonce)
-        valcode_addr = utils.mk_contract_address(self.coinbase.address, nonce)
-        # Verify the transaction passes
+    def broadcast_tx(self, tx):
+        """
+        Make sure that a transaction succeeds, and "broadcast" it to the chain service.
+        """
         temp_state = self.chain.state.ephemeral_clone()
-        valcode_success, o1 = apply_transaction(temp_state, valcode_tx)
+        success, output = apply_transaction(temp_state, tx)
+        if not success:
+            raise tester.TransactionFailed('Transaction failed, not broadcasting: {}'.format(str(tx)))
+        log.info('[hybrid_casper] Broadcasting successful tx: {}'.format(str(tx)))
+        self.chainservice.add_transaction(tx)
 
-        # We should never generate invalid txs
-        assert valcode_success
-
-        self.valcode_tx = valcode_tx
-        log.info('Valcode Tx generated: {}'.format(str(valcode_tx)))
-        self.valcode_addr = valcode_addr
-
-    def generate_deposit_tx(self):
-        nonce = self.chain.state.get_nonce(self.coinbase.address)
-        # Generate transaction
-        deposit_tx = self.mk_deposit_tx(self.deposit_size, self.valcode_addr, nonce)
-        # Verify the transaction passes
-        temp_state = self.chain.state.ephemeral_clone()
-        deposit_success, o2 = apply_transaction(temp_state, deposit_tx)
-
-        # We should never generate invalid txs
-        assert deposit_success
-
-        self.deposit_tx = deposit_tx
-        log.info('Deposit Tx generated: {}'.format(str(deposit_tx)))
-
-    def broadcast_logout(self, login_logout_flag):
+    def broadcast_logout(self):
         epoch = self.chain.state.block_number // self.epoch_length
         # Generage the message
         logout_msg = casper_utils.mk_logout(self.get_validator_index(self.chain.state),
                                             epoch, self.coinbase.privkey)
         # Generate transactions
         logout_tx = self.mk_logout_tx(logout_msg)
-        # Verify the transactions pass
-        temp_state = self.chain.state.ephemeral_clone()
-        logout_success, o1 = apply_transaction(temp_state, logout_tx)
-        if not logout_success:
-            raise Exception('Logout tx failed')
-        log.info('[hybrid_casper] Broadcasting logout tx: {}'.format(str(logout_tx)))
-        self.chainservice.add_transaction(logout_tx)
+        self.broadcast_tx(logout_tx)
 
     def update(self):
         log.info('[hybrid_casper] validator {} updating'.format(self))
@@ -109,10 +83,13 @@ class ValidatorService(BaseService):
         # the valcode tx exists before we attempt to broadcast the deposit tx.
 
         # Generate valcode and deposit transactions
-        elif not self.valcode_tx:
-            self.generate_valcode_tx()
-            log.info('[hybrid_casper] Broadcasting valcode tx and waiting for it to be mined')
-            self.chainservice.add_transaction(self.valcode_tx)
+        elif not self.did_broadcast_valcode:
+            valcode_tx = self.mk_validation_code_tx()
+            nonce = self.chain.state.get_nonce(self.coinbase.address)
+            self.valcode_addr = utils.mk_contract_address(self.coinbase.address, nonce)
+            log.info('[hybrid_casper] Broadcasting valcode tx: {}'.format(str(valcode_tx)))
+            self.broadcast_tx(valcode_tx)
+            self.did_broadcast_valcode = True
 
             # Wait for it to be mined
             return
@@ -124,9 +101,9 @@ class ValidatorService(BaseService):
 
         # Now we can broadcast the deposit
         elif not self.did_broadcast_deposit:
-            self.generate_deposit_tx()
-            log.info('[hybrid_casper] Broadcasting deposit tx')
-            self.chainservice.add_transaction(self.deposit_tx)
+            deposit_tx = self.mk_deposit_tx(self.deposit_size, self.valcode_addr)
+            log.info('[hybrid_casper] Broadcasting deposit tx: {}'.format(str(deposit_tx)))
+            self.broadcast_tx(deposit_tx)
             self.did_broadcast_deposit = True
 
             # Wait for it to be mined
@@ -136,7 +113,6 @@ class ValidatorService(BaseService):
         casper = tester.ABIContract(tester.State(self.chain.state.ephemeral_clone()), casper_utils.casper_abi,
                                     self.chain.casper_address)
         validator_index = self.get_validator_index(self.chain.state)
-        # validator_info = casper.get_validators(validator_index)
         log.info('[hybrid_casper] Active validator index: {}'.format(validator_index))
 
         # This fails if there are zero deposits (div. by zero), e.g. if we are the first
@@ -252,36 +228,34 @@ class ValidatorService(BaseService):
             return None
 
         # Zero represents failure
-        if vidx == 0:
-            return None
-        return vidx
+        return None if vidx == 0 else vidx
 
     def mk_transaction(self, to=b'\x00' * 20, value=0, data=b'',
-                       gasprice=tester.GASPRICE, startgas=tester.STARTGAS, nonce=None):
-        if nonce is None:
-            nonce = self.chain.state.get_nonce(self.coinbase.address)
+                       gasprice=tester.GASPRICE, startgas=tester.STARTGAS):
+        nonce = self.chain.state.get_nonce(self.coinbase.address)
         tx = transactions.Transaction(nonce, gasprice, startgas, to, value, data)
         self.coinbase.sign_tx(tx)
         return tx
 
-    def mk_validation_code_tx(self, nonce):
-        valcode_tx = self.mk_transaction('', 0, casper_utils.mk_validation_code(self.coinbase.address), nonce=nonce)
-        return valcode_tx
+    def mk_validation_code_tx(self):
+        return self.mk_transaction('', 0, casper_utils.mk_validation_code(self.coinbase.address))
 
-    def mk_deposit_tx(self, value, valcode_addr, nonce):
+    def mk_deposit_tx(self, value, valcode_addr):
         casper_ct = abi.ContractTranslator(casper_utils.casper_abi)
         deposit_func = casper_ct.encode('deposit', [valcode_addr, self.coinbase.address])
-        deposit_tx = self.mk_transaction(self.chain.casper_address, value, deposit_func, nonce=nonce)
-        return deposit_tx
+        return self.mk_transaction(self.chain.casper_address, value, deposit_func)
+
+    def mk_withdraw_tx(self, validator_idx):
+        casper_ct = abi.ContractTranslator(casper_utils.casper_abi)
+        withdraw_func = casper_ct.encode('withdraw', [validator_idx])
+        return self.mk_transaction(self.chain.casper_address, data=withdraw_func)
 
     def mk_logout_tx(self, login_logout_msg):
         casper_ct = abi.ContractTranslator(casper_utils.casper_abi)
         logout_func = casper_ct.encode('logout', [login_logout_msg])
-        logout_tx = self.mk_transaction(self.chain.casper_address, data=logout_func)
-        return logout_tx
+        return self.mk_transaction(self.chain.casper_address, data=logout_func)
 
     def mk_vote_tx(self, vote_msg):
         casper_ct = abi.ContractTranslator(casper_utils.casper_abi)
         vote_func = casper_ct.encode('vote', [vote_msg])
-        vote_tx = self.mk_transaction(to=self.chain.casper_address, value=0, startgas=1000000, data=vote_func)
-        return vote_tx
+        return self.mk_transaction(to=self.chain.casper_address, value=0, startgas=1000000, data=vote_func)
