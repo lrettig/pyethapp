@@ -100,11 +100,12 @@ def test_app(request, tmpdir):
                 'GENESIS_INITIAL_ALLOC': {
                     encode_hex(tester.accounts[0]): {'balance': 10**24},
                 },
-                # Casper FFG stuff
+                # Casper FFG stuff: set these arbitrarily short to facilitate testing
                 'EPOCH_LENGTH': 10,
-                'WITHDRAWAL_DELAY': 100,
+                'WITHDRAWAL_DELAY': 5,
                 'BASE_INTEREST_FACTOR': 0.02,
                 'BASE_PENALTY_FACTOR': 0.002,
+                'DEPOSIT_SIZE': 5000 * 10**18,
             }
         },
         'validate': [encode_hex(tester.accounts[0])],
@@ -127,11 +128,26 @@ def test_app(request, tmpdir):
 
     return app
 
-def test_login_sequence(test_app):
+def test_login_logout_withdraw(test_app):
+    """
+    Basic full-circle test of normal validator behavior in normal circumstances
+    (i.e., no slashing). Login, wait to vote, begin voting, logout, wait to withdraw
+    deposit, then withdraw.
+    """
     v = test_app.services.validator
+    epoch_length = test_app.config['eth']['block']['EPOCH_LENGTH']
+    withdrawal_delay = test_app.config['eth']['block']['WITHDRAWAL_DELAY']
+    base_interest_factor = test_app.config['eth']['block']['BASE_INTEREST_FACTOR']
+    base_penalty_factor = test_app.config['eth']['block']['BASE_PENALTY_FACTOR']
+    deposit_size = test_app.config['eth']['block']['DEPOSIT_SIZE']
+    initial_balance = test_app.config['eth']['block']['GENESIS_INITIAL_ALLOC'][encode_hex(v.coinbase.address)]['balance']
 
-    assert v.valcode_tx is None
-    assert v.deposit_tx is None
+    assert not v.did_broadcast_valcode
+    assert not v.did_broadcast_deposit
+    assert v.chain.state.get_balance(v.coinbase.address) == initial_balance
+
+    # We get opcode errors if this isn't true
+    assert v.chain.state.is_METROPOLIS()
 
     t = tester.State(v.chain.state.ephemeral_clone())
     c = tester.ABIContract(t, casper_utils.casper_abi, v.chain.casper_address)
@@ -140,15 +156,15 @@ def test_login_sequence(test_app):
     # Mining these first three blocks does the following:
     # 1. validator sends the valcode tx
     test_app.mine_blocks(1)
-    assert v.valcode_tx is not None
+    assert v.did_broadcast_valcode
+    assert not v.did_broadcast_deposit
     assert v.valcode_addr is not None
-    assert v.deposit_tx is None
     assert not v.chain.state.get_code(v.valcode_addr)
 
     # 2. validator sends the deposit tx
     test_app.mine_blocks(1)
-    assert v.valcode_tx is not None
-    assert v.deposit_tx is not None
+    assert v.did_broadcast_valcode
+    assert v.did_broadcast_deposit
     assert v.chain.state.get_code(v.valcode_addr)
 
     # This should still fail
@@ -157,6 +173,9 @@ def test_login_sequence(test_app):
 
     # 3. validator becomes active
     test_app.mine_blocks(3)
+
+    # Make sure the deposit moved
+    assert v.chain.state.get_balance(v.coinbase.address) == initial_balance - deposit_size
 
     # Check validator index
     validator_index = v.get_validator_index(v.chain.state)
@@ -179,7 +198,7 @@ def test_login_sequence(test_app):
     assert c.get_votes__is_finalized(1)
 
     # Make sure we're not logged in yet
-    target_epoch = v.chain.state.block_number // v.epoch_length
+    target_epoch = v.chain.state.block_number // epoch_length
     t = tester.State(v.chain.state.ephemeral_clone())
     c = tester.ABIContract(t, casper_utils.casper_abi, v.chain.casper_address)
     assert not v.is_logged_in(c, target_epoch, validator_index)
@@ -189,7 +208,7 @@ def test_login_sequence(test_app):
     t = tester.State(v.chain.state.ephemeral_clone())
     c = tester.ABIContract(t, casper_utils.casper_abi, v.chain.casper_address)
     assert c.get_current_epoch() == 3
-    target_epoch = v.chain.state.block_number // v.epoch_length
+    target_epoch = v.chain.state.block_number // epoch_length
     source_epoch = c.get_recommended_source_epoch()
     assert v.is_logged_in(c, target_epoch, validator_index)
 
@@ -205,8 +224,7 @@ def test_login_sequence(test_app):
     assert decode_int(vote_decoded[3]) == source_epoch
 
     # Check deposit level
-    # TODO: do not hardcode; pass into validator service on create
-    assert c.get_total_curdyn_deposits() == 5000 * 10**18
+    assert c.get_total_curdyn_deposits() == deposit_size
 
     # This should still fail
     with pytest.raises(tester.TransactionFailed):
@@ -229,23 +247,101 @@ def test_login_sequence(test_app):
     assert c.get_total_curdyn_deposits() > 5000 * 10**18
     assert voted_frac > 0.99
 
-def test_logout_and_withdraw(test_app):
-    pass
+    # Finally, test logout and withdraw
+    # Send logout
+    v.broadcast_logout()
+    test_app.mine_blocks(1)
+
+    # Make sure we can't withdraw yet
+    with pytest.raises(tester.TransactionFailed):
+        v.broadcast_withdraw()
+
+    # Make sure we are still logged in, can still vote, etc.
+    test_app.mine_to_next_epoch()
+
+    # One more block to mine the vote
+    test_app.mine_blocks(1)
+    t = tester.State(v.chain.state.ephemeral_clone())
+    c = tester.ABIContract(t, casper_utils.casper_abi, v.chain.casper_address)
+    assert c.get_current_epoch() == 5
+    voted_frac = c.get_main_hash_voted_frac()
+    assert c.get_total_curdyn_deposits() > 5000 * 10**18
+    assert voted_frac > 0.99
+    target_epoch = v.chain.state.block_number // epoch_length
+    assert v.is_logged_in(c, target_epoch, validator_index)
+    assert v.votes[target_epoch]
+
+    # Mine two epochs
+    test_app.mine_to_next_epoch()
+    test_app.mine_to_next_epoch()
+
+    # Make sure we don't vote, are not logged in
+    t = tester.State(v.chain.state.ephemeral_clone())
+    c = tester.ABIContract(t, casper_utils.casper_abi, v.chain.casper_address)
+    assert c.get_current_epoch() == 7
+
+    # This fails because of division by zero
+    with pytest.raises(tester.TransactionFailed):
+        c.get_main_hash_voted_frac()
+    assert c.get_total_curdyn_deposits() == 0
+    target_epoch = v.chain.state.block_number // epoch_length
+    assert not v.is_logged_in(c, target_epoch, validator_index)
+    with pytest.raises(KeyError):
+        v.votes[target_epoch]
+
+    # Mine until the epoch before we can withdraw
+    test_app.mine_to_next_epoch(withdrawal_delay)
+    t = tester.State(v.chain.state.ephemeral_clone())
+    c = tester.ABIContract(t, casper_utils.casper_abi, v.chain.casper_address)
+    assert c.get_current_epoch() == 12
+
+    # Make sure we cannot withdraw yet
+    with pytest.raises(tester.TransactionFailed):
+        v.broadcast_withdraw()
+
+    # Make sure we can withdraw exactly at this epoch, not before
+    test_app.mine_to_next_epoch()
+    t = tester.State(v.chain.state.ephemeral_clone())
+    c = tester.ABIContract(t, casper_utils.casper_abi, v.chain.casper_address)
+    assert c.get_current_epoch() == 13
+    v.broadcast_withdraw()
+    test_app.mine_blocks(1)
+
+    # Make sure deposit was refunded (along with interest)
+    assert v.chain.state.get_balance(v.coinbase.address) > initial_balance
 
 def test_double_login(test_app):
+    """
+    Make sure we cannot login a second time if already logged in. Make sure
+    second deposit tx fails.
+    """
     pass
 
 def test_login_logout_login(test_app):
+    """
+    Make sure we can login, logout, withdraw funds, then subsequently login
+    and deposit again.
+    """
     pass
 
 # Test slashing conditions--make sure that we don't violate them, and also
 # make sure that we can catch slashable behavior on the part of another validator.
 
 def test_prevent_double_vote(test_app):
+    """
+    Make sure the validator service never votes for the same target epoch twice.
+    """
     pass
 
 def test_no_surround(test_app):
+    """
+    Make sure the validator service never casts a vote surrounding another.
+    """
     pass
 
 def test_catch_violation(test_app):
+    """
+    Make sure the validator service recognizes and reports slashable behavior
+    on the part of another validator.
+    """
     pass
