@@ -89,17 +89,13 @@ class ValidatorService(BaseService):
 
     def update(self):
         log.info('[hybrid_casper] validator {} updating'.format(self))
-        # Make sure we have enough ETH to deposit
-        if self.chain.state.get_balance(self.coinbase.address) < self.deposit_size:
-            log.info('[hybrid_casper] Cannot login as validator: insufficient balance')
-            return
 
         # Note about valcode and deposit transactions: these need to be broadcast in
         # a particular order, valcode first. In order to ensure this, we check that
         # the valcode tx exists before we attempt to broadcast the deposit tx.
 
         # Generate valcode and deposit transactions
-        elif not self.did_broadcast_valcode:
+        if not self.did_broadcast_valcode:
             valcode_tx = self.mk_validation_code_tx()
             nonce = self.chain.state.get_nonce(self.coinbase.address)
             self.valcode_addr = utils.mk_contract_address(self.coinbase.address, nonce)
@@ -117,6 +113,11 @@ class ValidatorService(BaseService):
 
         # Now we can broadcast the deposit
         elif not self.did_broadcast_deposit:
+            # Make sure we have enough ETH to deposit
+            if self.chain.state.get_balance(self.coinbase.address) < self.deposit_size:
+                log.info('[hybrid_casper] Cannot login as validator: insufficient balance')
+                return
+
             deposit_tx = self.mk_deposit_tx(self.deposit_size, self.valcode_addr)
             log.info('[hybrid_casper] Broadcasting deposit tx: {}'.format(str(deposit_tx)))
             self.broadcast_tx(deposit_tx)
