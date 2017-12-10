@@ -37,7 +37,6 @@ class AccountsServiceMock(BaseService):
         self.coinbase = mock_address
 
     def find(self, address):
-
         assert address == encode_hex(tester.accounts[0])
         return mock_address
 
@@ -216,6 +215,8 @@ def test_login_sequence(test_app):
     # One more epoch and the vote_frac has a value (since it requires there
     # to be at least one vote for both the current and the prev epoch)
     test_app.mine_to_next_epoch()
+    t = tester.State(v.chain.state.ephemeral_clone())
+    c = tester.ABIContract(t, casper_utils.casper_abi, v.chain.casper_address)
     assert c.get_current_epoch() == 4
 
     # One more block to mine the vote
@@ -237,5 +238,14 @@ def test_double_login(test_app):
 def test_login_logout_login(test_app):
     pass
 
-def catch_violation(test_app):
+# Test slashing conditions--make sure that we don't violate them, and also
+# make sure that we can catch slashable behavior on the part of another validator.
+
+def test_prevent_double_vote(test_app):
+    pass
+
+def test_no_surround(test_app):
+    pass
+
+def test_catch_violation(test_app):
     pass

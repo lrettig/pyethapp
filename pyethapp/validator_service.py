@@ -177,7 +177,6 @@ class ValidatorService(BaseService):
             log.info('[hybrid_casper] Not voting this round')
 
     def is_logged_in(self, casper, target_epoch, validator_index):
-        log.debug('[hybrid_casper] checking is_logged_in for target {} and vidx {}'.format(target_epoch, validator_index))
         start_dynasty = casper.get_validators__start_dynasty(validator_index)
         end_dynasty = casper.get_validators__end_dynasty(validator_index)
         current_dynasty = casper.get_dynasty_in_epoch(target_epoch)
